@@ -5,6 +5,7 @@ SET(COMPILE_DEFINITIONS -Werror)
 
 include_directories(${PROJECT_SOURCE_DIR}/host_applications/linux/libs/bcm_host/include)
 include_directories(${PROJECT_SOURCE_DIR}/host_applications/linux/apps/raspicam/)
+include_directories(${PROJECT_SOURCE_DIR}/host_applications/linux/apps/raspicam/include)
 
 set (GL_SCENE_SOURCES
    gl_scenes/models.c
@@ -19,14 +20,14 @@ set (COMMON_SOURCES
    RaspiCLI.c
    RaspiPreview.c)
 
-add_executable(raspistill ${COMMON_SOURCES} RaspiStill.c  RaspiTex.c RaspiTexUtil.c tga.c ${GL_SCENE_SOURCES} libgps.c)
+add_executable(raspistill ${COMMON_SOURCES} RaspiStill.c  RaspiTex.c RaspiTexUtil.c tga.c ${GL_SCENE_SOURCES} naza.c teensy_naza.c libteensynaza.c serial.c crc16ansi.c can_naza.c libcannaza.c libgps.c iio_sensors.c iio_utils.c ahrs.c sample_dump.c calib.c)
 add_executable(raspiyuv   ${COMMON_SOURCES} RaspiStillYUV.c)
 add_executable(raspivid   ${COMMON_SOURCES} RaspiVid.c)
 add_executable(raspividyuv  ${COMMON_SOURCES} RaspiVidYUV.c)
 
 set (MMAL_LIBS mmal_core mmal_util mmal_vc_client)
 
-target_link_libraries(raspistill ${MMAL_LIBS} vcos bcm_host GLESv2 EGL m dl)
+target_link_libraries(raspistill ${MMAL_LIBS} vcos bcm_host GLESv2 EGL m dl rt pthread)
 target_link_libraries(raspiyuv   ${MMAL_LIBS} vcos bcm_host)
 target_link_libraries(raspivid   ${MMAL_LIBS} vcos bcm_host)
 target_link_libraries(raspividyuv   ${MMAL_LIBS} vcos bcm_host)

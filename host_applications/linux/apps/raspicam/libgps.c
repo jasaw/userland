@@ -48,7 +48,7 @@ static int libgps_load_sym(void **func, void *handle, char *symbol)
 
 int libgps_load(gpsd_info *gpsd)
 {
-   const char *LIBGPS = "libgps.so.20";
+   const char *LIBGPS = "libgps.so.21";
    int err = 0;
 
    gpsd->libgps_handle = dlopen(LIBGPS, RTLD_LAZY);

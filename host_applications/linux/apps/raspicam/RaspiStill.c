@@ -57,6 +57,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <errno.h>
 #include <sysexits.h>
 #include <math.h>
+#include <pthread.h>
+#include <time.h>
 
 #define VERSION_STRING "v1.3.8"
 
@@ -78,6 +80,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "RaspiTex.h"
 
 #include "libgps.h"
+#include "iio_sensors.h"
+#include "can_naza.h"
+#include "teensy_naza.h"
 
 #include <semaphore.h>
 
@@ -143,6 +148,13 @@ typedef struct
    int datetime;                       /// Use DateTime instead of frame#
    int timestamp;                      /// Use timestamp instead of frame#
    int gpsdExif;                       /// Add real-time gpsd output as EXIF tags
+   int bestEffortTimelapse;            /// Do not drop frames if unable to keep up with requested frame rate.
+   int ahrsExif;                       /// Add AHRS information as EXIF tags
+   const char *iio_dump_file;          /// Dump IIO samples to file
+   int canNazaExif;                    /// Add real-time NAZA information from CAN bus as EXIF tags
+   int teensyNazaExif;                 /// Add real-time NAZA information from Teensy via UART as EXIF tags
+   const char *nz_dump_file;           /// Dump NAZA data to file
+   double groundAlt;                   /// Ground altitude
 
    RASPIPREVIEW_PARAMETERS preview_parameters;    /// Preview setup parameters
    RASPICAM_CAMERA_PARAMETERS camera_parameters; /// Camera setup parameters
@@ -167,6 +179,20 @@ typedef struct
    VCOS_SEMAPHORE_T complete_semaphore; /// semaphore which is posted when we reach end of frame (indicates end of capture or fault)
    RASPISTILL_STATE *pstate;            /// pointer to our state in case required in callback
 } PORT_USERDATA;
+
+typedef struct
+{
+   struct can_naza_info_t can_nz;
+   RASPISTILL_STATE *pstate;            /// pointer to our state
+} CAN_NAZA_DATA;
+static CAN_NAZA_DATA can_nz_data;
+
+typedef struct
+{
+   struct teensy_naza_t ts_nz;
+   RASPISTILL_STATE *pstate;            /// pointer to our state
+} TEENSY_NAZA_DATA;
+static TEENSY_NAZA_DATA ts_nz_data;
 
 static void display_valid_parameters(char *app_name);
 static void store_exif_tag(RASPISTILL_STATE *state, const char *exif_tag);
@@ -198,6 +224,13 @@ static void store_exif_tag(RASPISTILL_STATE *state, const char *exif_tag);
 #define CommandDateTime     23
 #define CommandTimeStamp    24
 #define CommandGpsdExif     25
+#define CommandBestEffortTL 26
+#define CommandAhrsExif     27
+#define CommandDumpIIO      28
+#define CommandCanNazaExif  29
+#define CommandTeensyNazaExif 30
+#define CommandDumpNaza     31
+#define CommandGroundAlt    32
 
 static COMMAND_LIST cmdline_commands[] =
 {
@@ -227,6 +260,13 @@ static COMMAND_LIST cmdline_commands[] =
    { CommandDateTime,  "-datetime",  "dt", "Replace frame number in file name with DateTime (YearMonthDayHourMinSec)", 0},
    { CommandTimeStamp, "-timestamp", "ts", "Replace frame number in file name with unix timestamp (seconds since 1900)", 0},
    { CommandGpsdExif,  "-gpsdexif", "gps", "Apply real-time GPS information from gpsd as EXIF tags (requires libgps)", 0},
+   { CommandBestEffortTL, "-besteffort",  "be", "Do not drop frames if unable to keep up with timelapse frame rate", 0},
+   { CommandAhrsExif, "-ahrsexif", "ahrs", "Add AHRS information as EXIF tags (requires IIO sensors)", 0},
+   { CommandDumpIIO, "-dumpiio", "iio",   "Dump raw IIO samples to file", 1},
+   { CommandCanNazaExif, "-cannazaexif", "cnz", "Apply real-time NAZA information from CAN0 as EXIF tags", 0},
+   { CommandTeensyNazaExif, "-teensynazaexif", "tnz", "Apply real-time NAZA information from /dev/ttyAMA0 Teensy as EXIF tags", 0},
+   { CommandDumpNaza, "-dumpnaza", "dnz", "Dump NAZA data to file", 1},
+   { CommandGroundAlt, "-gndalt", "gnd",  "Set ground altitude as reference for relative altitude", 1},
 };
 
 static int cmdline_commands_size = sizeof(cmdline_commands) / sizeof(cmdline_commands[0]);
@@ -309,6 +349,13 @@ static void default_status(RASPISTILL_STATE *state)
    state->datetime = 0;
    state->timestamp = 0;
    state->gpsdExif = 0;
+   state->bestEffortTimelapse = 0;
+   state->ahrsExif = 0;
+   state->iio_dump_file = NULL;
+   state->canNazaExif = 0;
+   state->teensyNazaExif = 0;
+   state->nz_dump_file = NULL;
+   state->groundAlt = 0.0;
 
    // Setup preview window defaults
    raspipreview_set_defaults(&state->preview_parameters);
@@ -661,6 +708,43 @@ static int parse_cmdline(int argc, const char **argv, RASPISTILL_STATE *state)
       case CommandGpsdExif:
          state->gpsdExif = 1;
          break;
+
+      case CommandBestEffortTL:
+         state->bestEffortTimelapse = 1;
+         break;
+
+      case CommandAhrsExif:
+         state->ahrsExif = 1;
+         break;
+
+      case CommandDumpIIO:
+         state->iio_dump_file = argv[i + 1];
+         i++;
+         break;
+
+      case CommandCanNazaExif:
+         state->canNazaExif = 1;
+         break;
+
+      case CommandTeensyNazaExif:
+         state->teensyNazaExif = 1;
+         break;
+
+      case CommandDumpNaza:
+         state->nz_dump_file = argv[i + 1];
+         i++;
+         break;
+
+      case CommandGroundAlt:
+      {
+         if (sscanf(argv[i + 1], "%lf", &state->groundAlt) == 1)
+         {
+            i++;
+         }
+         else
+            valid = 0;
+         break;
+      }
 
 
       default:
@@ -1297,8 +1381,10 @@ static void add_exif_tags(RASPISTILL_STATE *state, struct gps_data_t *gpsdata)
 {
    time_t rawtime;
    struct tm *timeinfo;
+   struct tm naza_timeinfo;
+   struct naza_info_t *nz = NULL;
    char time_buf[32];
-   char exif_buf[128];
+   char exif_buf[256];
    int i;
 
    add_exif_tag(state, "IFD0.Model=RP_OV5647");
@@ -1306,6 +1392,189 @@ static void add_exif_tags(RASPISTILL_STATE *state, struct gps_data_t *gpsdata)
 
    time(&rawtime);
    timeinfo = localtime(&rawtime);
+
+   // Add NAZA tags
+   if (state->teensyNazaExif)
+   {
+      nz = &ts_nz_data.ts_nz.nz_dec.nz;
+      teensy_naza_process_messages(&ts_nz_data.ts_nz);
+   }
+   else if (state->canNazaExif)
+   {
+      nz = &can_nz_data.can_nz.nz_dec.nz;
+      can_naza_process_messages(&can_nz_data.can_nz);
+   }
+
+   if (nz)
+   {
+      if (state->verbose)
+         fprintf(stderr, "Adding GPS EXIF\n");
+
+      if ((nz->day > 0) &&
+          (nz->month > 0) &&
+          (nz->year > 14))
+      {
+         // GPS date time format (UTC): 0015-08-27 02:18:43
+         naza_timeinfo.tm_sec   = nz->second;
+         naza_timeinfo.tm_min   = nz->minute;
+         naza_timeinfo.tm_hour  = nz->hour;
+         naza_timeinfo.tm_mday  = nz->day;   // 1-31
+         naza_timeinfo.tm_mon   = nz->month - 1; // 0-11
+         naza_timeinfo.tm_year  = nz->year + 100;  // since 1900
+         naza_timeinfo.tm_isdst = -1; // Is DST on? 1 = yes, 0 = no, -1 = unknown
+
+         time_t tmptime = timegm(&naza_timeinfo);
+         timeinfo = localtime(&tmptime);
+
+         strftime(time_buf, sizeof(time_buf), "%Y:%m:%d", timeinfo);
+         snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSDateStamp=%s", time_buf);
+         add_exif_tag(state, exif_buf);
+         strftime(time_buf, sizeof(time_buf), "%H/1,%M/1,%S/1", timeinfo);
+         snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSTimeStamp=%s", time_buf);
+         add_exif_tag(state, exif_buf);
+      }
+
+      if (nz->fix > NO_FIX)
+      {
+         if (deg_to_str(fabs(nz->lat), time_buf, sizeof(time_buf)) == 0)
+         {
+            snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLatitude=%s", time_buf);
+            add_exif_tag(state, exif_buf);
+            snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLatitudeRef=%c",
+                     (nz->lat < 0) ? 'S' : 'N');
+            add_exif_tag(state, exif_buf);
+         }
+         if (deg_to_str(fabs(nz->lon), time_buf, sizeof(time_buf)) == 0)
+         {
+            snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLongitude=%s", time_buf);
+            add_exif_tag(state, exif_buf);
+            snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLongitudeRef=%c",
+                     (nz->lon < 0) ? 'W' : 'E');
+            add_exif_tag(state, exif_buf);
+         }
+         snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSAltitude=%d/10",
+                  (int)(nz->gpsAlt*10+0.5));
+         add_exif_tag(state, exif_buf);
+         add_exif_tag(state, "GPS.GPSAltitudeRef=0");
+         snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSSpeed=%d/10",
+                  (int)(nz->spd*MPS_TO_KPH*10+0.5));
+         add_exif_tag(state, exif_buf);
+         add_exif_tag(state, "GPS.GPSSpeedRef=K");
+         snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSTrack=%d/100",
+                  (int)(nz->cog*100+0.5));
+         add_exif_tag(state, exif_buf);
+         add_exif_tag(state, "GPS.GPSTrackRef=T");
+         snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSMeasureMode=%c",
+                  (nz->fix >= FIX_3D) ? '3' : '2');
+         add_exif_tag(state, exif_buf);
+         snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSSatellites=NumSat:%d",
+                  nz->sat);
+         add_exif_tag(state, exif_buf);
+      }
+
+      snprintf(exif_buf, sizeof(exif_buf),
+               "EXIF.UserComment=Roll:%d,Pitch:%d,Heading:%.2f,RelAlt:%.2f,Alt:%.2f,Batt:%.2fV(%d%%)",
+               nz->roll,
+               nz->pitch,
+               nz->heading,
+               nz->alt - state->groundAlt,
+               nz->alt,
+               ((float)nz->battery)/1000,
+               nz->batteryPercent);
+      add_exif_tag(state, exif_buf);
+   }
+   else
+   {
+      // Add GPS tags
+      if (state->gpsdExif)
+      {
+         if (gpsdata->online)
+         {
+            if (state->verbose)
+               fprintf(stderr, "Adding GPS EXIF\n");
+            if (gpsdata->set & TIME_SET)
+            {
+               rawtime = gpsdata->fix.time;
+               timeinfo = localtime(&rawtime);
+               strftime(time_buf, sizeof(time_buf), "%Y:%m:%d", timeinfo);
+               snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSDateStamp=%s", time_buf);
+               add_exif_tag(state, exif_buf);
+               strftime(time_buf, sizeof(time_buf), "%H/1,%M/1,%S/1", timeinfo);
+               snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSTimeStamp=%s", time_buf);
+               add_exif_tag(state, exif_buf);
+            }
+            if ((gpsdata->set & LATLON_SET) && (gpsdata->fix.mode >= MODE_2D))
+            {
+               if (isnan(gpsdata->fix.latitude) == 0)
+               {
+                  if (deg_to_str(fabs(gpsdata->fix.latitude), time_buf, sizeof(time_buf)) == 0)
+                  {
+                     snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLatitude=%s", time_buf);
+                     add_exif_tag(state, exif_buf);
+                     snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLatitudeRef=%c",
+                              (gpsdata->fix.latitude < 0) ? 'S' : 'N');
+                     add_exif_tag(state, exif_buf);
+                  }
+               }
+               if (isnan(gpsdata->fix.longitude) == 0)
+               {
+                  if (deg_to_str(fabs(gpsdata->fix.longitude), time_buf, sizeof(time_buf)) == 0)
+                  {
+                     snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLongitude=%s", time_buf);
+                     add_exif_tag(state, exif_buf);
+                     snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLongitudeRef=%c",
+                              (gpsdata->fix.longitude < 0) ? 'W' : 'E');
+                     add_exif_tag(state, exif_buf);
+                  }
+               }
+            }
+            if ((gpsdata->set & ALTITUDE_SET) && (gpsdata->fix.mode >= MODE_3D))
+            {
+               if (isnan(gpsdata->fix.altitude) == 0)
+               {
+                  snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSAltitude=%d/10",
+                           (int)(gpsdata->fix.altitude*10+0.5));
+                  add_exif_tag(state, exif_buf);
+                  add_exif_tag(state, "GPS.GPSAltitudeRef=0");
+               }
+            }
+            if ((gpsdata->set & SPEED_SET) && (gpsdata->fix.mode >= MODE_2D))
+            {
+               if (isnan(gpsdata->fix.speed) == 0)
+               {
+                  snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSSpeed=%d/10",
+                           (int)(gpsdata->fix.speed*MPS_TO_KPH*10+0.5));
+                  add_exif_tag(state, exif_buf);
+                  add_exif_tag(state, "GPS.GPSSpeedRef=K");
+               }
+            }
+            if ((gpsdata->set & TRACK_SET) && (gpsdata->fix.mode >= MODE_2D))
+            {
+               if (isnan(gpsdata->fix.track) == 0)
+               {
+                  snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSTrack=%d/100",
+                           (int)(gpsdata->fix.track*100+0.5));
+                  add_exif_tag(state, exif_buf);
+                  add_exif_tag(state, "GPS.GPSTrackRef=T");
+               }
+            }
+         }
+      }
+
+      // Add AHRS tags
+      if (state->ahrsExif)
+      {
+         double roll;
+         double pitch;
+         double magn_heading;
+         double relative_altitude;
+         iio_sensors_get_ahrs(&roll, &pitch, &magn_heading, &relative_altitude);
+
+         snprintf(exif_buf, sizeof(exif_buf), "EXIF.UserComment=Roll:%.2f,Pitch:%.2f,Heading:%.2f,RelAltitude:%.2f",
+                  roll, pitch, magn_heading, relative_altitude);
+         add_exif_tag(state, exif_buf);
+      }
+   }
 
    snprintf(time_buf, sizeof(time_buf),
             "%04d:%02d:%02d %02d:%02d:%02d",
@@ -1324,83 +1593,6 @@ static void add_exif_tags(RASPISTILL_STATE *state, struct gps_data_t *gpsdata)
 
    snprintf(exif_buf, sizeof(exif_buf), "IFD0.DateTime=%s", time_buf);
    add_exif_tag(state, exif_buf);
-
-
-   // Add GPS tags
-   if (state->gpsdExif)
-   {
-      if (gpsdata->online)
-      {
-         if (state->verbose)
-            fprintf(stderr, "Adding GPS EXIF\n");
-         if (gpsdata->set & TIME_SET)
-         {
-            rawtime = gpsdata->fix.time;
-            timeinfo = localtime(&rawtime);
-            strftime(time_buf, sizeof(time_buf), "%Y:%m:%d", timeinfo);
-            snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSDateStamp=%s", time_buf);
-            add_exif_tag(state, exif_buf);
-            strftime(time_buf, sizeof(time_buf), "%H/1,%M/1,%S/1", timeinfo);
-            snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSTimeStamp=%s", time_buf);
-            add_exif_tag(state, exif_buf);
-         }
-         if ((gpsdata->set & LATLON_SET) && (gpsdata->fix.mode >= MODE_2D))
-         {
-            if (isnan(gpsdata->fix.latitude) == 0)
-            {
-               if (deg_to_str(fabs(gpsdata->fix.latitude), time_buf, sizeof(time_buf)) == 0)
-               {
-                  snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLatitude=%s", time_buf);
-                  add_exif_tag(state, exif_buf);
-                  snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLatitudeRef=%c",
-                           (gpsdata->fix.latitude < 0) ? 'S' : 'N');
-                  add_exif_tag(state, exif_buf);
-               }
-            }
-            if (isnan(gpsdata->fix.longitude) == 0)
-            {
-               if (deg_to_str(fabs(gpsdata->fix.longitude), time_buf, sizeof(time_buf)) == 0)
-               {
-                  snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLongitude=%s", time_buf);
-                  add_exif_tag(state, exif_buf);
-                  snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSLongitudeRef=%c",
-                           (gpsdata->fix.longitude < 0) ? 'W' : 'E');
-                  add_exif_tag(state, exif_buf);
-               }
-            }
-         }
-         if ((gpsdata->set & ALTITUDE_SET) && (gpsdata->fix.mode >= MODE_3D))
-         {
-            if (isnan(gpsdata->fix.altitude) == 0)
-            {
-               snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSAltitude=%d/10",
-                        (int)(gpsdata->fix.altitude*10+0.5));
-               add_exif_tag(state, exif_buf);
-               add_exif_tag(state, "GPS.GPSAltitudeRef=0");
-            }
-         }
-         if ((gpsdata->set & SPEED_SET) && (gpsdata->fix.mode >= MODE_2D))
-         {
-            if (isnan(gpsdata->fix.speed) == 0)
-            {
-               snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSSpeed=%d/10",
-                        (int)(gpsdata->fix.speed*MPS_TO_KPH*10+0.5));
-               add_exif_tag(state, exif_buf);
-               add_exif_tag(state, "GPS.GPSSpeedRef=K");
-            }
-         }
-         if ((gpsdata->set & TRACK_SET) && (gpsdata->fix.mode >= MODE_2D))
-         {
-            if (isnan(gpsdata->fix.track) == 0)
-            {
-               snprintf(exif_buf, sizeof(exif_buf), "GPS.GPSTrack=%d/100",
-                        (int)(gpsdata->fix.track*100+0.5));
-               add_exif_tag(state, exif_buf);
-               add_exif_tag(state, "GPS.GPSTrackRef=T");
-            }
-         }
-      }
-   }
 
    // Now send any user supplied tags
 
@@ -1583,23 +1775,33 @@ static int wait_for_next_frame(RASPISTILL_STATE *state, int *frame)
       {
          int64_t this_delay_ms = next_frame_ms - current_time;
 
+         if (state->verbose)
+            fprintf(stderr, "Next frame in: %"PRId64" ms\n", this_delay_ms);
          if (this_delay_ms < 0)
          {
             // We are already past the next exposure time
-            if (-this_delay_ms < -state->timelapse/2)
+            if (state->bestEffortTimelapse)
             {
-               // Less than a half frame late, take a frame and hope to catch up next time
-               next_frame_ms += state->timelapse;
-               vcos_log_error("Frame %d is %d ms late", *frame, (int)(-this_delay_ms));
+               int nskip = (-this_delay_ms)/state->timelapse;
+               next_frame_ms += (nskip + 1) * state->timelapse;
             }
             else
             {
-               int nskip = 1 + (-this_delay_ms)/state->timelapse;
-               vcos_log_error("Skipping frame %d to restart at frame %d", *frame, *frame+nskip);
-               *frame += nskip;
-               this_delay_ms += nskip * state->timelapse;
-               vcos_sleep(this_delay_ms);
-               next_frame_ms += (nskip + 1) * state->timelapse;
+               if (-this_delay_ms < -state->timelapse/2)
+               {
+                  // Less than a half frame late, take a frame and hope to catch up next time
+                  next_frame_ms += state->timelapse;
+                  vcos_log_error("Frame %d is %d ms late", *frame, (int)(-this_delay_ms));
+               }
+               else
+               {
+                  int nskip = 1 + (-this_delay_ms)/state->timelapse;
+                  vcos_log_error("Skipping frame %d to restart at frame %d", *frame, *frame+nskip);
+                  *frame += nskip;
+                  this_delay_ms += nskip * state->timelapse;
+                  vcos_sleep(this_delay_ms);
+                  next_frame_ms += (nskip + 1) * state->timelapse;
+               }
             }
          }
          else
@@ -1727,6 +1929,23 @@ static void rename_file(RASPISTILL_STATE *state, FILE *output_file,
    }
 }
 
+
+void *can_naza_process(void *naza_data_ptr)
+{
+   CAN_NAZA_DATA *nz_d = (CAN_NAZA_DATA *)naza_data_ptr;
+   can_naza_rx_frames(&nz_d->can_nz, nz_d->pstate->verbose);
+   return NULL;
+}
+
+
+void *teensy_naza_process(void *naza_data_ptr)
+{
+   TEENSY_NAZA_DATA *nz_d = (TEENSY_NAZA_DATA *)naza_data_ptr;
+   teensy_naza_rx_frames(&nz_d->ts_nz, nz_d->pstate->verbose);
+   return NULL;
+}
+
+
 /**
  * main
  */
@@ -1735,6 +1954,7 @@ int main(int argc, const char **argv)
    // Our main data storage vessel..
    RASPISTILL_STATE state;
    gpsd_info gpsd;
+   pthread_t naza_thread;
    int exit_code = EX_OK;
 
    MMAL_STATUS_T status = MMAL_SUCCESS;
@@ -1779,11 +1999,20 @@ int main(int argc, const char **argv)
       dump_status(&state);
    }
 
+   if (state.ahrsExif)
+   {
+      if (iio_sensors_init(NULL, state.iio_dump_file))
+         exit(EX_SOFTWARE);
+   }
+
    if (state.gpsdExif)
    {
       gpsd_init(&gpsd);
       if (libgps_load(&gpsd))
-         exit(EX_SOFTWARE);
+      {
+         exit_code = EX_SOFTWARE;
+         goto err_gpsd;
+      }
       if (state.verbose)
          fprintf(stderr, "Connecting to gpsd @ %s:%s\n", gpsd.server, gpsd.port);
       if (connect_gpsd(&gpsd))
@@ -1791,14 +2020,68 @@ int main(int argc, const char **argv)
          fprintf(stderr, "no gpsd running or network error: %d, %s\n",
                  errno, gpsd.gps_errstr(errno));
          libgps_unload(&gpsd);
-         exit(EX_SOFTWARE);
+         exit_code = EX_SOFTWARE;
+         goto err_gpsd;
       }
       if (state.verbose)
          fprintf(stderr, "Waiting for GPS time\n");
-      if (wait_gps_time(&gpsd, 5))
+      if (wait_gps_time(&gpsd, 2))
       {
          if (state.verbose)
             fprintf(stderr, "Warning: GPS time not available\n");
+      }
+   }
+
+   if (state.teensyNazaExif)
+   {
+      ts_nz_data.pstate = &state;
+      const char *teensy_serial_interface = "/dev/ttyAMA0";
+      if (state.verbose)
+      {
+         fprintf(stderr, "NAZA: ground reference altitude %.2fm\n", state.groundAlt);
+         fprintf(stderr, "NAZA: Opening %s\n", teensy_serial_interface);
+         if (state.nz_dump_file)
+            fprintf(stderr, "NAZA: Dumping to %s\n", state.nz_dump_file);
+      }
+      if (teensy_naza_init(&ts_nz_data.ts_nz, teensy_serial_interface, state.nz_dump_file))
+      {
+         fprintf(stderr, "Failed to open %s\n", teensy_serial_interface);
+         exit_code = EX_SOFTWARE;
+         goto err_teensy_naza;
+      }
+      if (state.verbose)
+         fprintf(stderr, "NAZA: creating thread\n");
+      if (pthread_create(&naza_thread, NULL, teensy_naza_process, &ts_nz_data))
+      {
+         fprintf(stderr, "Error creating NAZA thread\n");
+         exit_code = EX_SOFTWARE;
+         goto err_teensy_naza;
+      }
+   }
+   else if (state.canNazaExif)
+   {
+      can_nz_data.pstate = &state;
+      const char *can_interface = "can0";
+      if (state.verbose)
+      {
+         fprintf(stderr, "NAZA: ground reference altitude %.2fm\n", state.groundAlt);
+         fprintf(stderr, "NAZA: Opening %s\n", can_interface);
+         if (state.nz_dump_file)
+            fprintf(stderr, "NAZA: Dumping to %s\n", state.nz_dump_file);
+      }
+      if (can_naza_init(&can_nz_data.can_nz, can_interface, state.nz_dump_file))
+      {
+         fprintf(stderr, "Failed to open %s interface\n", can_interface);
+         exit_code = EX_SOFTWARE;
+         goto err_can_naza;
+      }
+      if (state.verbose)
+         fprintf(stderr, "NAZA: creating thread\n");
+      if (pthread_create(&naza_thread, NULL, can_naza_process, &can_nz_data))
+      {
+         fprintf(stderr, "Error creating NAZA thread\n");
+         exit_code = EX_SOFTWARE;
+         goto err_can_naza;
       }
    }
 
@@ -1912,11 +2195,10 @@ int main(int argc, const char **argv)
             {
                 if (state.gpsdExif)
                    connect_gpsd(&gpsd);
+                if (state.ahrsExif)
+                   iio_sensors_process();
 
             	keep_looping = wait_for_next_frame(&state, &frame);
-
-                if (state.gpsdExif)
-                   read_gps_data(&gpsd);
 
                 if (state.datetime)
                 {
@@ -2057,7 +2339,16 @@ int main(int argc, const char **argv)
                      // Wait for capture to complete
                      // For some reason using vcos_semaphore_wait_timeout sometimes returns immediately with bad parameter error
                      // even though it appears to be all correct, so reverting to untimed one until figure out why its erratic
-                     vcos_semaphore_wait(&callback_data.complete_semaphore);
+                     int semret = !VCOS_SUCCESS;
+                     while (semret != VCOS_SUCCESS)
+                     {
+                        if (state.ahrsExif)
+                           iio_sensors_process();
+                        if (state.gpsdExif)
+                           read_gps_data(&gpsd);
+                        semret = vcos_semaphore_wait_timeout(&callback_data.complete_semaphore, 200);
+                     }
+                     //vcos_semaphore_wait(&callback_data.complete_semaphore);
                      if (state.verbose)
                         fprintf(stderr, "Finished capture %d\n", frame);
                   }
@@ -2137,24 +2428,48 @@ error:
       destroy_camera_component(&state);
 
       if (state.verbose)
-         fprintf(stderr, "Close down completed, all components disconnected, disabled and destroyed\n\n");
-   }
-
-   if (state.gpsdExif)
-   {
-      if (state.verbose)
-      {
-         if (gpsd.gpsd_connected)
-            fprintf(stderr, "Closing gpsd connection\n\n");
-      }
-      disconnect_gpsd(&gpsd);
-      libgps_unload(&gpsd);
+         fprintf(stderr, "Close down completed, all components disconnected, disabled and destroyed\n");
    }
 
    if (status != MMAL_SUCCESS)
       raspicamcontrol_check_configuration(128);
 
+
+   if (state.teensyNazaExif)
+   {
+      teensy_naza_terminate(&ts_nz_data.ts_nz);
+      teensy_naza_close(&ts_nz_data.ts_nz);
+   }
+   else if (state.canNazaExif)
+   {
+      can_naza_terminate(&can_nz_data.can_nz);
+      can_naza_close(&can_nz_data.can_nz);
+   }
+err_teensy_naza:
+err_can_naza:
+   if (state.gpsdExif)
+   {
+      if (state.verbose)
+      {
+         if (gpsd.gpsd_connected)
+            fprintf(stderr, "Closing gpsd connection\n");
+      }
+      disconnect_gpsd(&gpsd);
+      libgps_unload(&gpsd);
+   }
+err_gpsd:
+   if (state.ahrsExif)
+      iio_sensors_clean_up();
+
+   if ((state.teensyNazaExif) || (state.canNazaExif))
+   {
+      if (state.verbose)
+         fprintf(stderr, "Waiting for NAZA thread to terminate\n");
+      pthread_join(naza_thread, NULL);
+   }
+
+   if (state.verbose)
+      fprintf(stderr, "\n");
+
    return exit_code;
 }
-
-
